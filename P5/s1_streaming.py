@@ -1,44 +1,20 @@
 """Sesión 1. Streaming: mostrar la respuesta según se genera (mejora la latencia percibida)."""
-import os
+import sys
+import time
+from pathlib import Path
 
-import anthropic
-import openai
-from dotenv import load_dotenv
-from google import genai
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "P3"))  # llm_client.py vive en P3
+from llm_client import FORMATOS, LLM  # noqa: E402
 
-load_dotenv()
 PREGUNTA = "Explica en cinco líneas qué es un acuerdo de nivel de servicio (SLA)."
 
-print("--- OpenAI")
-for evento in openai.OpenAI().responses.create(
-    model=os.environ["OPENAI_MODEL"], input=PREGUNTA, stream=True
-):
-    if evento.type == "response.output_text.delta":
-        print(evento.delta, end="", flush=True)
-
-print("\n--- Claude")
-with anthropic.Anthropic().messages.stream(
-    model=os.environ["ANTHROPIC_MODEL"], max_tokens=512,
-    messages=[{"role": "user", "content": PREGUNTA}],
-) as flujo:
-    for trozo in flujo.text_stream:
+# Adaptación a Ollama: un mismo modelo servido por los tres formatos de API
+for formato in FORMATOS:
+    print(f"--- llama3.2 ({formato})")
+    inicio = time.perf_counter()
+    primero = None
+    for trozo in LLM("llama3.2:latest", formato).responder_stream("Responde en español.", PREGUNTA):
+        if primero is None:
+            primero = time.perf_counter() - inicio
         print(trozo, end="", flush=True)
-
-print("\n--- Gemini")
-if os.getenv("GEMINI_API_KEY"):  # opcional: API nativa de Gemini
-    cliente = genai.Client()  # en una variable: si no, el SDK cierra el cliente antes de usarlo
-    for evento in cliente.interactions.create(
-        model=os.environ["GEMINI_MODEL"].removeprefix("google/"), input=PREGUNTA, stream=True
-    ):
-        if evento.event_type == "step.delta" and evento.delta.type == "text":
-            print(evento.delta.text, end="", flush=True)
-else:  # por defecto, vía OpenRouter con Chat Completions
-    cliente = openai.OpenAI(base_url="https://openrouter.ai/api/v1",
-                            api_key=os.environ["OPENROUTER_API_KEY"])
-    for trozo in cliente.chat.completions.create(
-        model=os.environ["GEMINI_MODEL"], messages=[{"role": "user", "content": PREGUNTA}],
-        stream=True,
-    ):
-        if trozo.choices and trozo.choices[0].delta.content:
-            print(trozo.choices[0].delta.content, end="", flush=True)
-print()
+    print(f"\n[primer fragmento: {primero:.2f} s | total: {time.perf_counter() - inicio:.2f} s]\n")
