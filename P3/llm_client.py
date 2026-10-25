@@ -1,23 +1,38 @@
-"""Sesión 1. Una interfaz común para varios proveedores (patrón Adapter).
+"""Sesión 1. Una interfaz común para varios formatos de API (patrón Adapter), todo con Ollama.
 
-El resto del bloque usará LLM.responder() cuando el proveedor dé igual."""
-import os
+Ollama habla tres formatos de API en el mismo puerto: Chat Completions (/v1/chat/completions),
+Responses (/v1/responses) y Messages de Anthropic (/v1/messages). Cada uno se usa con su SDK
+oficial (openai o anthropic) apuntando a Ollama.
+
+El resto del bloque usará LLM.responder() cuando el formato dé igual."""
+import re
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import anthropic
 import openai
-from dotenv import load_dotenv
-from google import genai
 
-load_dotenv()
+OLLAMA = "http://localhost:11434"
+MODELOS = ["phi3:latest", "llama3.2:latest", "qwen3:0.6b"]
+FORMATOS = ["chat", "responses", "messages"]
 
-OPENROUTER = "https://openrouter.ai/api/v1"
+# Precios en USD por millón de tokens (entrada, salida). Los modelos locales no cobran por token,
+# así que valen 0. Si quieres un coste de referencia, pon aquí el de un modelo de nube equivalente.
+PRECIOS: dict[str, tuple[float, float]] = {
+    "phi3:latest": (0.0, 0.0),
+    "llama3.2:latest": (0.0, 0.0),
+    "qwen3:0.6b": (0.0, 0.0),
+}
 
-# Precios en USD por millón de tokens (entrada, salida), con el id del modelo tal y como
-# va en .env, p. ej. "openai/gpt-5.4-mini". Rellénalos con https://openrouter.ai/models:
-# cambian a menudo y no conviene fiarse de la memoria.
-PRECIOS: dict[str, tuple[float, float]] = {}
+MAX_TOKENS_POR_DEFECTO = 1024  # Messages exige max_tokens; en el resto solo se envía si se pasa
+
+
+def _limpiar(texto: str) -> str:
+    """qwen3 es un modelo de razonamiento: quitamos su bloque <think>...</think>, incluso
+    si se cortó por max_tokens antes de cerrarse (entonces no queda texto)."""
+    texto = re.sub(r"<think>.*?</think>", "", texto, flags=re.DOTALL)
+    return re.sub(r"<think>.*", "", texto, flags=re.DOTALL).strip()
 
 
 @dataclass
@@ -37,76 +52,100 @@ class Respuesta:
 
 
 class LLM:
-    """proveedor: 'openai' | 'claude' | 'gemini' | 'ollama'.
+    """modelo: uno de MODELOS (por defecto llama3.2). formato: 'chat' | 'responses' | 'messages'.
 
-    Cada proveedor habla un formato de API: Responses (OpenAI), Messages (Claude),
-    Interactions (Gemini nativo) o Chat Completions (Gemini vía OpenRouter y Ollama)."""
+    Cada formato usa su SDK: Chat Completions y Responses con openai, Messages con anthropic."""
 
-    def __init__(self, proveedor: str, modelo: str | None = None):
-        self.proveedor = proveedor
-        defecto = {
-            "openai": os.getenv("OPENAI_MODEL"),
-            "claude": os.getenv("ANTHROPIC_MODEL"),
-            "gemini": os.getenv("GEMINI_MODEL"),
-            "ollama": "llama3.2",
-        }
-        self.modelo = modelo or defecto[proveedor]
-        if proveedor == "openai":
-            self.formato = "responses"
-            self._c = openai.OpenAI(max_retries=3)  # reintentos con espera exponencial
-        elif proveedor == "claude":
-            self.formato = "messages"
-            self._c = anthropic.Anthropic(max_retries=3)
-        elif proveedor == "gemini" and os.getenv("GEMINI_API_KEY"):  # opcional: API nativa
-            self.formato = "interactions"
-            self.modelo = self.modelo.removeprefix("google/")
-            self._c = genai.Client()
-        elif proveedor == "gemini":  # por defecto, vía OpenRouter
-            self.formato = "chat"
-            self._c = openai.OpenAI(base_url=OPENROUTER, api_key=os.environ["OPENROUTER_API_KEY"],
-                                    max_retries=3)
-        elif proveedor == "ollama":  # Ollama expone una API compatible con OpenAI
-            self.formato = "chat"
-            self._c = openai.OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
-        else:
-            raise ValueError(f"Proveedor no soportado: {proveedor}")
+    def __init__(self, modelo: str = "llama3.2:latest", formato: str = "chat"):
+        if formato not in FORMATOS:
+            raise ValueError(f"formato debe ser uno de {FORMATOS}")
+        self.modelo = modelo
+        self.formato = formato
+        if formato == "messages":
+            self._c = anthropic.Anthropic(base_url=OLLAMA, api_key="ollama", max_retries=3)
+        else:  # la clave se exige pero se ignora
+            self._c = openai.OpenAI(base_url=OLLAMA + "/v1", api_key="ollama", max_retries=3)
 
-    def responder(self, sistema: str, prompt: str, temperatura: float | None = None) -> Respuesta:
-        extra = {} if temperatura is None else {"temperature": temperatura}
+    def responder(self, sistema: str, prompt: str, temperatura: float | None = None,
+                  max_tokens: int | None = None) -> Respuesta:
         t0 = time.perf_counter()
         if self.formato == "responses":
-            # TODO 1 (P3): OpenAI con la Responses API. Llama a self._c.responses.create(...)
-            # con self.modelo, el sistema, el prompt y **extra, y rellena texto, t_in y t_out.
-            # Pista: con_openai() en s1_hola_tres.py hace la misma llamada.
-            raise NotImplementedError("TODO 1: rama 'responses' (OpenAI)")
+            extra = {}
+            if temperatura is not None:
+                extra["temperature"] = temperatura
+            if max_tokens is not None:
+                extra["max_output_tokens"] = max_tokens
+            r = self._c.responses.create(
+                model=self.modelo, instructions=sistema, input=prompt, **extra)
+            texto, t_in, t_out = r.output_text, r.usage.input_tokens, r.usage.output_tokens
         elif self.formato == "messages":
-            # TODO 2 (P3): Claude con la Messages API. Llama a self._c.messages.create(...).
-            # Ojo: max_tokens es obligatorio, el sistema no va dentro de messages y el texto
-            # llega repartido en bloques. Pista: con_claude() en s1_hola_tres.py.
-            raise NotImplementedError("TODO 2: rama 'messages' (Claude)")
-        elif self.formato == "interactions":
-            config = {"generation_config": extra} if extra else {}
-            r = self._c.interactions.create(
-                model=self.modelo, system_instruction=sistema, input=prompt, **config
+            extra = {} if temperatura is None else {"temperature": temperatura}
+            r = self._c.messages.create(
+                model=self.modelo,
+                system=sistema,  # el mensaje de sistema no va dentro de messages
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens or MAX_TOKENS_POR_DEFECTO,  # obligatorio
+                **extra,
             )
-            texto, t_in, t_out = r.output_text, r.usage.total_input_tokens, r.usage.total_output_tokens
-        else:  # Chat Completions, el formato "clásico" de OpenAI que imitan casi todos
-            # Esta rama ya está hecha: úsala de modelo para las dos de arriba.
+            # el texto llega repartido en bloques (text, thinking...): unimos los de tipo text
+            texto = "".join(b.text for b in r.content if b.type == "text")
+            t_in, t_out = r.usage.input_tokens, r.usage.output_tokens
+        else:  # "chat"
+            extra = {}
+            if temperatura is not None:
+                extra["temperature"] = temperatura
+            if max_tokens is not None:
+                extra["max_tokens"] = max_tokens
             r = self._c.chat.completions.create(
                 model=self.modelo,
                 messages=[{"role": "system", "content": sistema}, {"role": "user", "content": prompt}],
                 **extra,
             )
-            texto = r.choices[0].message.content
+            texto = r.choices[0].message.content or ""
             t_in, t_out = r.usage.prompt_tokens, r.usage.completion_tokens
-        return Respuesta(texto, t_in, t_out, time.perf_counter() - t0, self.modelo)
+        return Respuesta(_limpiar(texto or ""), t_in, t_out, time.perf_counter() - t0, self.modelo)
+
+    def responder_stream(self, sistema: str, prompt: str, temperatura: float | None = None,
+                         max_tokens: int | None = None) -> Iterator[str]:
+        """Reto opcional: generador de fragmentos de texto (sin filtrar <think> de qwen3)."""
+        if self.formato == "responses":
+            extra = {}
+            if temperatura is not None:
+                extra["temperature"] = temperatura
+            if max_tokens is not None:
+                extra["max_output_tokens"] = max_tokens
+            flujo = self._c.responses.create(
+                model=self.modelo, instructions=sistema, input=prompt, stream=True, **extra)
+            for ev in flujo:
+                if ev.type == "response.output_text.delta":
+                    yield ev.delta
+        elif self.formato == "messages":
+            extra = {} if temperatura is None else {"temperature": temperatura}
+            with self._c.messages.stream(
+                model=self.modelo, system=sistema,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens or MAX_TOKENS_POR_DEFECTO, **extra,
+            ) as flujo:
+                yield from flujo.text_stream
+        else:  # "chat"
+            extra = {}
+            if temperatura is not None:
+                extra["temperature"] = temperatura
+            if max_tokens is not None:
+                extra["max_tokens"] = max_tokens
+            flujo = self._c.chat.completions.create(
+                model=self.modelo, stream=True,
+                messages=[{"role": "system", "content": sistema}, {"role": "user", "content": prompt}],
+                **extra,
+            )
+            for trozo in flujo:
+                if trozo.choices and trozo.choices[0].delta.content:
+                    yield trozo.choices[0].delta.content
 
 
 if __name__ == "__main__":
-    for proveedor in ["openai", "claude", "gemini"]:
-        try:
-            r = LLM(proveedor).responder("Responde en una frase.", "¿Qué es un token?")
-        except NotImplementedError as e:
-            print(f"{proveedor:7} pendiente: {e}")
-            continue
-        print(f"{proveedor:7} {r.segundos:5.2f} s  {r.tokens_entrada:4}/{r.tokens_salida:<4} {r.texto}")
+    # un formato distinto por modelo, para ejercitar las tres ramas
+    for modelo, formato in zip(MODELOS, FORMATOS):
+        r = LLM(modelo, formato).responder("Responde en una frase.", "¿Qué es un token?")
+        print(f"{modelo:16} {formato:9} {r.segundos:5.2f} s  {r.tokens_entrada:4}/{r.tokens_salida:<4} "
+              f"{r.coste_usd}  {r.texto}")

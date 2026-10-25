@@ -1,15 +1,12 @@
-"""Sesión 1. El mismo encargo a tres proveedores: respuesta, tokens y latencia."""
-import os
+"""Sesión 1. El mismo encargo a tres modelos locales de Ollama: respuesta, tokens y latencia."""
+import re
 import time
 
-import anthropic
 import openai
-from dotenv import load_dotenv
-from google import genai
 
-load_dotenv()
-
-OPENROUTER = "https://openrouter.ai/api/v1"
+# Ollama expone una API compatible con Chat Completions de OpenAI en este puerto
+OLLAMA = "http://localhost:11434/v1"
+MODELOS = ["phi3:latest", "llama3.2:latest", "qwen3:0.6b"]
 SISTEMA = ("Eres el asistente de atención al cliente de Tostadero Retiro S.L. "
            "Responde en español y en dos frases como máximo.")
 CORREO = ("Hola, soy Marta del Bar La Esquina. La cafetera vuelve a perder presión y mañana "
@@ -18,46 +15,21 @@ PETICION = ("Clasifica este correo como pedido, incidencia, consulta o mixto y r
             f"una respuesta breve:\n\n{CORREO}")
 
 
-def con_openai() -> tuple[str, int, int]:
-    cliente = openai.OpenAI()  # lee OPENAI_API_KEY y OPENAI_BASE_URL del entorno
-    r = cliente.responses.create(
-        model=os.environ["OPENAI_MODEL"], instructions=SISTEMA, input=PETICION
-    )
-    return r.output_text, r.usage.input_tokens, r.usage.output_tokens
-
-
-def con_claude() -> tuple[str, int, int]:
-    cliente = anthropic.Anthropic()  # lee ANTHROPIC_API_KEY y ANTHROPIC_BASE_URL
-    r = cliente.messages.create(
-        model=os.environ["ANTHROPIC_MODEL"],
-        max_tokens=512,  # obligatorio en la API de Claude
-        system=SISTEMA,
-        messages=[{"role": "user", "content": PETICION}],
-    )
-    texto = "".join(b.text for b in r.content if b.type == "text")
-    return texto, r.usage.input_tokens, r.usage.output_tokens
-
-
-def con_gemini() -> tuple[str, int, int]:
-    if os.getenv("GEMINI_API_KEY"):  # opcional: API nativa de Gemini (Interactions API)
-        cliente = genai.Client()  # lee GEMINI_API_KEY
-        r = cliente.interactions.create(
-            model=os.environ["GEMINI_MODEL"].removeprefix("google/"),
-            system_instruction=SISTEMA, input=PETICION,
-        )
-        return r.output_text, r.usage.total_input_tokens, r.usage.total_output_tokens
-    # Por defecto, vía OpenRouter con Chat Completions: el formato que imitan casi todos
-    cliente = openai.OpenAI(base_url=OPENROUTER, api_key=os.environ["OPENROUTER_API_KEY"])
+def con_ollama(modelo: str) -> tuple[str, int, int]:
+    cliente = openai.OpenAI(base_url=OLLAMA, api_key="ollama")  # la clave se exige pero se ignora
     r = cliente.chat.completions.create(
-        model=os.environ["GEMINI_MODEL"],
+        model=modelo,
         messages=[{"role": "system", "content": SISTEMA}, {"role": "user", "content": PETICION}],
     )
-    return r.choices[0].message.content, r.usage.prompt_tokens, r.usage.completion_tokens
+    texto = r.choices[0].message.content or ""
+    # qwen3 es un modelo de razonamiento: quitamos su bloque <think>...</think>
+    texto = re.sub(r"<think>.*?</think>", "", texto, flags=re.DOTALL).strip()
+    return texto, r.usage.prompt_tokens, r.usage.completion_tokens
 
 
 if __name__ == "__main__":
-    for nombre, llamar in [("OpenAI", con_openai), ("Claude", con_claude), ("Gemini", con_gemini)]:
+    for modelo in MODELOS:
         inicio = time.perf_counter()
-        texto, t_in, t_out = llamar()
-        print(f"\n=== {nombre} | {time.perf_counter() - inicio:.2f} s | "
+        texto, t_in, t_out = con_ollama(modelo)
+        print(f"\n=== {modelo} | {time.perf_counter() - inicio:.2f} s | "
               f"{t_in} tokens entrada | {t_out} tokens salida\n{texto}")
